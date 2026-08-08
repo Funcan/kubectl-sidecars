@@ -26,6 +26,7 @@ type options struct {
 	configFlags *genericclioptions.ConfigFlags
 
 	allNamespaces bool
+	runningOnly   bool
 	imagePatterns []string
 
 	genericiooptions.IOStreams
@@ -43,6 +44,8 @@ func newOptions(streams genericiooptions.IOStreams) *options {
 func (o *options) bindFlags(flags *pflag.FlagSet) {
 	flags.BoolVarP(&o.allNamespaces, "all-namespaces", "A", o.allNamespaces,
 		"List pods across all namespaces.")
+	flags.BoolVar(&o.runningOnly, "running-only", o.runningOnly,
+		"Only show pods in the Running phase (skip Pending, Succeeded, Failed, etc.).")
 
 	o.configFlags.AddFlags(flags)
 }
@@ -183,6 +186,22 @@ func (m *sidecarMatcher) filter() podFilter {
 	}
 }
 
+// isRunning reports whether a pod is healthily running: its phase is Running
+// and every container reports Ready. This skips pods that are Pending,
+// Succeeded/Completed, Failed, or Running-but-with-a-container in a bad state
+// such as CrashLoopBackOff.
+func isRunning(pod *corev1.Pod) bool {
+	if pod.Status.Phase != corev1.PodRunning {
+		return false
+	}
+	for _, s := range pod.Status.ContainerStatuses {
+		if !s.Ready {
+			return false
+		}
+	}
+	return true
+}
+
 // getPods lists pods from the cluster. When allNamespaces is set it lists pods
 // in every namespace; otherwise it uses the namespace resolved from the
 // standard kubectl connection flags (falling back to the kubeconfig default).
@@ -227,7 +246,12 @@ func (o *options) run(ctx context.Context) error {
 		return err
 	}
 
-	matched := filterPods(pods, sidecarFilter.filter())
+	filters := []podFilter{sidecarFilter.filter()}
+	if o.runningOnly {
+		filters = append(filters, isRunning)
+	}
+
+	matched := filterPods(pods, filters...)
 	return o.printPods(matched, sidecarFilter)
 }
 
