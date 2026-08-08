@@ -7,8 +7,13 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
+	"strings"
+	"text/tabwriter"
 
 	"github.com/spf13/pflag"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/cli-runtime/pkg/genericiooptions"
 	"k8s.io/client-go/kubernetes"
@@ -19,6 +24,9 @@ import (
 // IO streams.
 type options struct {
 	configFlags *genericclioptions.ConfigFlags
+
+	allNamespaces bool
+	imagePatterns []string
 
 	genericiooptions.IOStreams
 }
@@ -33,21 +41,171 @@ func newOptions(streams genericiooptions.IOStreams) *options {
 // bindFlags registers this plugin's flags followed by the standard kubectl
 // connection flags (-n/--namespace, --context, --kubeconfig, etc.).
 func (o *options) bindFlags(flags *pflag.FlagSet) {
+	flags.BoolVarP(&o.allNamespaces, "all-namespaces", "A", o.allNamespaces,
+		"List pods across all namespaces.")
+
 	o.configFlags.AddFlags(flags)
 }
 
 // complete fills in any values derived from the parsed positional arguments.
+// Each positional argument is a glob pattern to match sidecar images against.
 func (o *options) complete(args []string) error {
+	o.imagePatterns = args
 	return nil
 }
 
-// validate checks that the options are internally consistent.
+// validate checks that the options are internally consistent, including that
+// every image pattern compiles.
 func (o *options) validate(args []string) error {
+	for _, p := range o.imagePatterns {
+		if _, err := compileGlob(p); err != nil {
+			return fmt.Errorf("invalid image pattern %q: %w", p, err)
+		}
+	}
 	return nil
 }
 
-// run contains the plugin logic. It builds a Kubernetes client from the
-// resolved connection flags; the actual work is not implemented yet.
+// podFilter reports whether a pod should be kept. Filters are composed by
+// filterPods, so each one only needs to decide a single pod.
+type podFilter func(*corev1.Pod) bool
+
+// filterPods returns the pods that satisfy every provided filter. With no
+// filters it returns all pods.
+func filterPods(pods []corev1.Pod, filters ...podFilter) []corev1.Pod {
+	var out []corev1.Pod
+	for i := range pods {
+		keep := true
+		for _, f := range filters {
+			if !f(&pods[i]) {
+				keep = false
+				break
+			}
+		}
+		if keep {
+			out = append(out, pods[i])
+		}
+	}
+	return out
+}
+
+// compileGlob translates a shell-style glob into an anchored regexp. Unlike
+// path.Match, '*' and '?' also match '/', so a pattern like "*istio*" matches
+// images such as "docker.io/istio/proxyv2".
+func compileGlob(pattern string) (*regexp.Regexp, error) {
+	var b strings.Builder
+	b.WriteString("^")
+	for _, r := range pattern {
+		switch r {
+		case '*':
+			b.WriteString(".*")
+		case '?':
+			b.WriteString(".")
+		default:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	b.WriteString("$")
+	return regexp.Compile(b.String())
+}
+
+// isNativeSidecar reports whether an init container is a native (sidecar) init
+// container, i.e. one with a restartPolicy of Always.
+func isNativeSidecar(c *corev1.Container) bool {
+	return c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways
+}
+
+// sidecarImages returns the images of a pod's sidecar containers: every
+// .spec.containers[] entry plus native sidecars (.spec.initContainers[] whose
+// restartPolicy is Always).
+func sidecarImages(pod *corev1.Pod) []string {
+	var imgs []string
+	for i := range pod.Spec.Containers {
+		imgs = append(imgs, pod.Spec.Containers[i].Image)
+	}
+	for i := range pod.Spec.InitContainers {
+		c := &pod.Spec.InitContainers[i]
+		if isNativeSidecar(c) {
+			imgs = append(imgs, c.Image)
+		}
+	}
+	return imgs
+}
+
+// sidecarMatcher matches sidecar container images against a set of glob
+// patterns. A matcher with no patterns matches every sidecar image.
+type sidecarMatcher struct {
+	patterns []*regexp.Regexp
+}
+
+func newSidecarMatcher(patterns ...string) (*sidecarMatcher, error) {
+	res := make([]*regexp.Regexp, 0, len(patterns))
+	for _, p := range patterns {
+		re, err := compileGlob(p)
+		if err != nil {
+			return nil, fmt.Errorf("invalid image pattern %q: %w", p, err)
+		}
+		res = append(res, re)
+	}
+	return &sidecarMatcher{patterns: res}, nil
+}
+
+// matches reports whether image matches any pattern. With no patterns every
+// image matches.
+func (m *sidecarMatcher) matches(image string) bool {
+	if len(m.patterns) == 0 {
+		return true
+	}
+	for _, re := range m.patterns {
+		if re.MatchString(image) {
+			return true
+		}
+	}
+	return false
+}
+
+// images returns the pod's sidecar images that match the patterns. When no
+// patterns are set this is every sidecar image.
+func (m *sidecarMatcher) images(pod *corev1.Pod) []string {
+	var out []string
+	for _, img := range sidecarImages(pod) {
+		if m.matches(img) {
+			out = append(out, img)
+		}
+	}
+	return out
+}
+
+// filter returns a podFilter that keeps pods with at least one matching
+// sidecar.
+func (m *sidecarMatcher) filter() podFilter {
+	return func(pod *corev1.Pod) bool {
+		return len(m.images(pod)) > 0
+	}
+}
+
+// getPods lists pods from the cluster. When allNamespaces is set it lists pods
+// in every namespace; otherwise it uses the namespace resolved from the
+// standard kubectl connection flags (falling back to the kubeconfig default).
+func (o *options) getPods(ctx context.Context, clientset kubernetes.Interface) ([]corev1.Pod, error) {
+	namespace := ""
+	if !o.allNamespaces {
+		var err error
+		namespace, _, err = o.configFlags.ToRawKubeConfigLoader().Namespace()
+		if err != nil {
+			return nil, fmt.Errorf("resolving namespace: %w", err)
+		}
+	}
+
+	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("listing pods: %w", err)
+	}
+
+	return pods.Items, nil
+}
+
+// run contains the plugin logic: list pods, keep those with a matching
+// sidecar, and print the results.
 func (o *options) run(ctx context.Context) error {
 	restConfig, err := o.configFlags.ToRESTConfig()
 	if err != nil {
@@ -58,9 +216,32 @@ func (o *options) run(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("creating clientset: %w", err)
 	}
-	_ = clientset
 
-	return fmt.Errorf("not implemented")
+	pods, err := o.getPods(ctx, clientset)
+	if err != nil {
+		return err
+	}
+
+	sidecarFilter, err := newSidecarMatcher(o.imagePatterns...)
+	if err != nil {
+		return err
+	}
+
+	matched := filterPods(pods, sidecarFilter.filter())
+	return o.printPods(matched, sidecarFilter)
+}
+
+// printPods writes the matching pods and their matching sidecar images as a
+// table.
+func (o *options) printPods(pods []corev1.Pod, matcher *sidecarMatcher) error {
+	w := tabwriter.NewWriter(o.Out, 0, 8, 2, ' ', 0)
+	fmt.Fprintln(w, "NAMESPACE\tPOD\tSIDECARS")
+	for i := range pods {
+		pod := &pods[i]
+		fmt.Fprintf(w, "%s\t%s\t%s\n",
+			pod.Namespace, pod.Name, strings.Join(matcher.images(pod), ","))
+	}
+	return w.Flush()
 }
 
 func main() {
