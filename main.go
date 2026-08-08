@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"text/tabwriter"
 
@@ -27,6 +28,7 @@ type options struct {
 
 	allNamespaces bool
 	runningOnly   bool
+	countOnly     bool
 	imagePatterns []string
 
 	genericiooptions.IOStreams
@@ -46,6 +48,8 @@ func (o *options) bindFlags(flags *pflag.FlagSet) {
 		"List pods across all namespaces.")
 	flags.BoolVar(&o.runningOnly, "running-only", o.runningOnly,
 		"Only show pods in the Running phase (skip Pending, Succeeded, Failed, etc.).")
+	flags.BoolVar(&o.countOnly, "count", o.countOnly,
+		"Instead of listing pods, list each unique matching sidecar image and the number of pods running it.")
 
 	o.configFlags.AddFlags(flags)
 }
@@ -252,7 +256,39 @@ func (o *options) run(ctx context.Context) error {
 	}
 
 	matched := filterPods(pods, filters...)
+	if o.countOnly {
+		return o.printCounts(matched, sidecarFilter)
+	}
 	return o.printPods(matched, sidecarFilter)
+}
+
+// printCounts writes each unique matching sidecar image and the number of pods
+// running it, sorted by image name.
+func (o *options) printCounts(pods []corev1.Pod, matcher *sidecarMatcher) error {
+	counts := map[string]int{}
+	for i := range pods {
+		seen := map[string]bool{}
+		for _, img := range matcher.images(&pods[i]) {
+			if seen[img] {
+				continue
+			}
+			seen[img] = true
+			counts[img]++
+		}
+	}
+
+	images := make([]string, 0, len(counts))
+	for img := range counts {
+		images = append(images, img)
+	}
+	sort.Strings(images)
+
+	w := tabwriter.NewWriter(o.Out, 0, 8, 2, ' ', 0)
+	fmt.Fprintln(w, "SIDECAR\tPODS")
+	for _, img := range images {
+		fmt.Fprintf(w, "%s\t%d\n", img, counts[img])
+	}
+	return w.Flush()
 }
 
 // printPods writes the matching pods and their matching sidecar images as a
