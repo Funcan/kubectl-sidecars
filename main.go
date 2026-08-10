@@ -190,20 +190,12 @@ func (m *sidecarMatcher) filter() podFilter {
 	}
 }
 
-// isRunning reports whether a pod is healthily running: its phase is Running
-// and every container reports Ready. This skips pods that are Pending,
-// Succeeded/Completed, Failed, or Running-but-with-a-container in a bad state
-// such as CrashLoopBackOff.
+// isRunning reports whether a pod is in the Running phase. This skips pods that
+// are Pending, Succeeded/Completed, or Failed. It does not require containers to
+// be Ready: a container whose process is running but whose readiness probe is
+// failing still counts, matching how kubectl reports the pod as Running.
 func isRunning(pod *corev1.Pod) bool {
-	if pod.Status.Phase != corev1.PodRunning {
-		return false
-	}
-	for _, s := range pod.Status.ContainerStatuses {
-		if !s.Ready {
-			return false
-		}
-	}
-	return true
+	return pod.Status.Phase == corev1.PodRunning
 }
 
 // getPods lists pods from the cluster. When allNamespaces is set it lists pods
