@@ -20,6 +20,20 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
+// Build information. These are set at build time via -ldflags -X, both by the
+// Makefile and by goreleaser. They default to values suitable for a plain
+// `go build` or `go install`.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
+// versionString returns a human-readable one-line version summary.
+func versionString() string {
+	return fmt.Sprintf("kubectl-sidecars %s (commit %s, built %s)", version, commit, date)
+}
+
 // options holds everything needed to run the plugin: the standard kubectl
 // connection flags (via genericclioptions) plus this plugin's own flags and
 // IO streams.
@@ -29,6 +43,7 @@ type options struct {
 	allNamespaces bool
 	runningOnly   bool
 	countOnly     bool
+	showVersion   bool
 	imagePatterns []string
 
 	genericiooptions.IOStreams
@@ -50,6 +65,8 @@ func (o *options) bindFlags(flags *pflag.FlagSet) {
 		"Only show pods in the Running phase (skip Pending, Succeeded, Failed, etc.).")
 	flags.BoolVar(&o.countOnly, "count", o.countOnly,
 		"Instead of listing pods, list each unique matching sidecar image and the number of pods running it.")
+	flags.BoolVar(&o.showVersion, "version", o.showVersion,
+		"Print version information and exit.")
 
 	o.configFlags.AddFlags(flags)
 }
@@ -312,6 +329,11 @@ func main() {
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		fmt.Fprintln(streams.ErrOut, err)
 		os.Exit(1)
+	}
+
+	if o.showVersion {
+		fmt.Fprintln(streams.Out, versionString())
+		return
 	}
 
 	args := flags.Args()
